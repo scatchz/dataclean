@@ -21,48 +21,38 @@ SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets.readonly",
     "https://www.googleapis.com/auth/drive.readonly",
 ]
-import json, tempfile, os
-
-def get_client_secret_file():
-    """Write secrets to a temp file so Google OAuth library can read it."""
-    secret_data = {
-        "web": {
-            "client_id": st.secrets["google_oauth"]["client_id"],
-            "client_secret": st.secrets["google_oauth"]["client_secret"],
-            "redirect_uris": [st.secrets["google_oauth"]["redirect_uri"]],
-            "auth_uri": "https://accounts.google.com/o/oauth2/auth",
-            "token_uri": "https://oauth2.googleapis.com/token",
-        }
-    }
-    tmp = tempfile.NamedTemporaryFile(
-        mode="w", suffix=".json", delete=False
-    )
-    json.dump(secret_data, tmp)
-    tmp.close()
-    return tmp.name
+CLIENT_SECRET_FILE = "client_secret.json"
 REDIRECT_URI = "https://dataclean-st.streamlit.app/"
 
-def get_google_credentials():
-    """Run OAuth flow and return credentials. Caches token in session state."""
-    if "google_token" in st.session_state:
-        creds = Credentials(
-            token=st.session_state["google_token"]["token"],
-            refresh_token=st.session_state["google_token"]["refresh_token"],
-            token_uri="https://oauth2.googleapis.com/token",
-            client_id=st.session_state["google_token"]["client_id"],
-            client_secret=st.session_state["google_token"]["client_secret"],
-            scopes=SCOPES,
-        )
-        return creds
-    return None
+def get_auth_url():
+    flow = Flow.from_client_secrets_file(
+        CLIENT_SECRET_FILE,
+        scopes=SCOPES,
+        redirect_uri=REDIRECT_URI,
+    )
+    auth_url, state = flow.authorization_url(
+        prompt="consent",
+        access_type="offline",
+    )
+    st.session_state["oauth_state"] = state
+    return auth_url, flow
 
-def load_google_sheet(sheet_url: str, creds) -> pd.DataFrame:
-    """Load a Google Sheet into a DataFrame given its URL."""
-    gc = gspread.authorize(creds)
-    sh = gc.open_by_url(sheet_url)
-    worksheet = sh.get_active_worksheet()
-    data = worksheet.get_all_records()
-    return pd.DataFrame(data)
+def exchange_code_for_token(code):
+    flow = Flow.from_client_secrets_file(
+        CLIENT_SECRET_FILE,
+        scopes=SCOPES,
+        redirect_uri=REDIRECT_URI,
+        state=st.session_state.get("oauth_state"),
+    )
+    flow.fetch_token(code=code)
+    creds = flow.credentials
+    st.session_state["google_token"] = {
+        "token": creds.token,
+        "refresh_token": creds.refresh_token,
+        "client_id": creds.client_id,
+        "client_secret": creds.client_secret,
+    }
+
 
 warnings.filterwarnings("ignore")
 matplotlib.use("Agg")
@@ -440,34 +430,25 @@ if page == "📁 Upload & Overview":
     st.markdown("---")
     st.markdown("#### 🔗 Connect Google Sheets (optional)")
 
+    query_params = st.query_params
+    if "code" in query_params and "google_token" not in st.session_state:
+        with st.spinner("Completing sign-in..."):
+            try:
+                exchange_code_for_token(query_params["code"])
+                st.query_params.clear()
+                st.success("✓ Connected to Google!")
+                st.rerun()
+            except Exception as e:
+                st.error(f"Auth failed: {e}")
+
     creds = get_google_credentials()
 
     if creds is None:
-        if st.button("🔐 Sign in with Google"):
-            flow = Flow.from_client_secrets_file(
-                CLIENT_SECRET_FILE,
-                scopes=SCOPES,
-                redirect_uri="urn:ietf:wg:oauth:2.0:oob",  # Desktop flow
-            )
-            auth_url, _ = flow.authorization_url(prompt="consent")
-            st.markdown(f"**[Click here to authorize]({auth_url})**")
-            st.info("After authorizing, Google will show you a code. Paste it below.")
-
-            auth_code = st.text_input("Paste your authorization code here:")
-            if auth_code and st.button("✓ Submit Code"):
-                flow.fetch_token(code=auth_code)
-                creds = flow.credentials
-                st.session_state["google_token"] = {
-                    "token": creds.token,
-                    "refresh_token": creds.refresh_token,
-                    "client_id": creds.client_id,
-                    "client_secret": creds.client_secret,
-                }
-                st.success("✓ Connected to Google!")
-                st.rerun()
+        auth_url, _ = get_auth_url()
+        st.link_button("🔐 Sign in with Google", auth_url)
     else:
         st.success("✓ Google account connected")
-        if st.button("Disconnect Google"):
+        if st.button("Disconnect"):
             del st.session_state["google_token"]
             st.rerun()
 
