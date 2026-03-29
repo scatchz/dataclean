@@ -15,12 +15,32 @@ from google_auth_oauthlib.flow import Flow
 from googleapiclient.discovery import build
 from google.oauth2.credentials import Credentials
 import gspread
+from google_auth_oauthlib.flow import Flow
 
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets.readonly",
     "https://www.googleapis.com/auth/drive.readonly",
 ]
-CLIENT_SECRET_FILE = "client_secret.json"
+import json, tempfile, os
+
+def get_client_secret_file():
+    """Write secrets to a temp file so Google OAuth library can read it."""
+    secret_data = {
+        "web": {
+            "client_id": st.secrets["google_oauth"]["client_id"],
+            "client_secret": st.secrets["google_oauth"]["client_secret"],
+            "redirect_uris": [st.secrets["google_oauth"]["redirect_uri"]],
+            "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+            "token_uri": "https://oauth2.googleapis.com/token",
+        }
+    }
+    tmp = tempfile.NamedTemporaryFile(
+        mode="w", suffix=".json", delete=False
+    )
+    json.dump(secret_data, tmp)
+    tmp.close()
+    return tmp.name
+REDIRECT_URI = "https://dataclean-st.streamlit.app/"
 
 def get_google_credentials():
     """Run OAuth flow and return credentials. Caches token in session state."""
