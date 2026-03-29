@@ -11,48 +11,6 @@ import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 from scipy import stats
-from google_auth_oauthlib.flow import Flow
-from googleapiclient.discovery import build
-from google.oauth2.credentials import Credentials
-import gspread
-from google_auth_oauthlib.flow import Flow
-
-SCOPES = [
-    "https://www.googleapis.com/auth/spreadsheets.readonly",
-    "https://www.googleapis.com/auth/drive.readonly",
-]
-CLIENT_SECRET_FILE = "client_secret.json"
-REDIRECT_URI = "https://dataclean-st.streamlit.app/"
-
-def get_auth_url():
-    flow = Flow.from_client_secrets_file(
-        CLIENT_SECRET_FILE,
-        scopes=SCOPES,
-        redirect_uri=REDIRECT_URI,
-    )
-    auth_url, state = flow.authorization_url(
-        prompt="consent",
-        access_type="offline",
-    )
-    st.session_state["oauth_state"] = state
-    return auth_url, flow
-
-def exchange_code_for_token(code):
-    flow = Flow.from_client_secrets_file(
-        CLIENT_SECRET_FILE,
-        scopes=SCOPES,
-        redirect_uri=REDIRECT_URI,
-        state=st.session_state.get("oauth_state"),
-    )
-    flow.fetch_token(code=code)
-    creds = flow.credentials
-    st.session_state["google_token"] = {
-        "token": creds.token,
-        "refresh_token": creds.refresh_token,
-        "client_id": creds.client_id,
-        "client_secret": creds.client_secret,
-    }
-
 
 warnings.filterwarnings("ignore")
 matplotlib.use("Agg")
@@ -64,7 +22,7 @@ except ImportError:
     EXCEL_OK = False
 
 # =========================================================
-# PAGE CONFIG
+# PAGE CONFIG  — must be first Streamlit call
 # =========================================================
 st.set_page_config(
     page_title="DataClean",
@@ -73,6 +31,89 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
+# =========================================================
+# GOOGLE OAUTH — imports + functions (after set_page_config)
+# =========================================================
+try:
+    from google_auth_oauthlib.flow import Flow
+    from google.oauth2.credentials import Credentials
+    import gspread
+    GOOGLE_OK = True
+except ImportError:
+    GOOGLE_OK = False
+
+SCOPES = [
+    "https://www.googleapis.com/auth/spreadsheets.readonly",
+    "https://www.googleapis.com/auth/drive.readonly",
+]
+REDIRECT_URI = "https://dataclean-st.streamlit.app/"
+
+def get_client_secret_file():
+    """Build a temp client_secret.json from Streamlit secrets."""
+    import tempfile
+    secret_data = {
+        "web": {
+            "client_id":     st.secrets["google_oauth"]["client_id"],
+            "client_secret": st.secrets["google_oauth"]["client_secret"],
+            "redirect_uris": [st.secrets["google_oauth"]["redirect_uri"]],
+            "auth_uri":  "https://accounts.google.com/o/oauth2/auth",
+            "token_uri": "https://oauth2.googleapis.com/token",
+        }
+    }
+    tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False)
+    json.dump(secret_data, tmp)
+    tmp.close()
+    return tmp.name
+
+def get_auth_url():
+    """Return the Google OAuth authorization URL and the flow object."""
+    secret_file = get_client_secret_file()
+    flow = Flow.from_client_secrets_file(secret_file, scopes=SCOPES, redirect_uri=REDIRECT_URI)
+    auth_url, state = flow.authorization_url(prompt="consent", access_type="offline")
+    st.session_state["oauth_state"] = state
+    return auth_url, flow
+
+def exchange_code_for_token(code):
+    """Exchange the OAuth callback code for a token and store it in session."""
+    secret_file = get_client_secret_file()
+    flow = Flow.from_client_secrets_file(
+        secret_file, scopes=SCOPES, redirect_uri=REDIRECT_URI,
+        state=st.session_state.get("oauth_state"),
+    )
+    flow.fetch_token(code=code)
+    creds = flow.credentials
+    st.session_state["google_token"] = {
+        "token":         creds.token,
+        "refresh_token": creds.refresh_token,
+        "client_id":     creds.client_id,
+        "client_secret": creds.client_secret,
+    }
+
+def get_google_credentials():
+    """Return a Credentials object from session, or None if not signed in."""
+    tok = st.session_state.get("google_token")
+    if tok:
+        return Credentials(
+            token=tok["token"],
+            refresh_token=tok["refresh_token"],
+            token_uri="https://oauth2.googleapis.com/token",
+            client_id=tok["client_id"],
+            client_secret=tok["client_secret"],
+            scopes=SCOPES,
+        )
+    return None
+
+def load_google_sheet(sheet_url: str, creds) -> pd.DataFrame:
+    """Load a Google Sheet into a DataFrame."""
+    gc = gspread.authorize(creds)
+    sh = gc.open_by_url(sheet_url)
+    worksheet = sh.get_active_worksheet()
+    data = worksheet.get_all_records()
+    return pd.DataFrame(data)
+
+# =========================================================
+# STYLES
+# =========================================================
 st.markdown("""
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap');
@@ -427,55 +468,68 @@ if page == "📁 Upload & Overview":
 
     card("Upload a <b>CSV, Excel (.xlsx/.xls), or JSON</b> file to get started. The app will profile your data and guide you through cleaning.", "info")
 
+    # ── Google Sheets Section ──────────────────────────
     st.markdown("---")
     st.markdown("#### 🔗 Connect Google Sheets (optional)")
 
-    query_params = st.query_params
-    if "code" in query_params and "google_token" not in st.session_state:
-        with st.spinner("Completing sign-in..."):
-            try:
-                exchange_code_for_token(query_params["code"])
-                st.query_params.clear()
-                st.success("✓ Connected to Google!")
-                st.rerun()
-            except Exception as e:
-                st.error(f"Auth failed: {e}")
-
-    creds = get_google_credentials()
-
-    if creds is None:
-        auth_url, _ = get_auth_url()
-        st.link_button("🔐 Sign in with Google", auth_url)
+    if not GOOGLE_OK:
+        card("Google Sheets libraries not installed. Run: <code>pip install google-auth google-auth-oauthlib gspread</code>", "warn")
+    elif "google_oauth" not in st.secrets:
+        card("Google OAuth not configured. Add <code>[google_oauth]</code> credentials to your Streamlit secrets to enable this feature.", "warn")
     else:
-        st.success("✓ Google account connected")
-        if st.button("Disconnect"):
-            del st.session_state["google_token"]
-            st.rerun()
-
-        sheet_url = st.text_input(
-            "Paste your Google Sheet URL:",
-            placeholder="https://docs.google.com/spreadsheets/d/..."
-        )
-        if sheet_url and st.button("📥 Load Google Sheet"):
-            with st.spinner("Loading sheet..."):
+        # Handle OAuth callback — Google redirects back here with ?code=...
+        query_params = st.query_params
+        if "code" in query_params and "google_token" not in st.session_state:
+            with st.spinner("Completing Google sign-in…"):
                 try:
-                    df = load_google_sheet(sheet_url, creds)
-                    st.session_state.update({
-                        "original_df": df.copy(),
-                        "working_df": df.copy(),
-                        "history": [], "log": [],
-                        "filename": "Google Sheet",
-                        "last_msg": f"✓ Loaded Google Sheet — {len(df):,} rows × {df.shape[1]} columns.",
-                        "last_msg_type": "success",
-                        "last_before": None, "last_after": None, "last_impact": None,
-                    })
-                    log_step("load_google_sheet", {"url": sheet_url}, list(df.columns))
+                    exchange_code_for_token(query_params["code"])
+                    st.query_params.clear()
+                    st.success("✓ Connected to Google!")
                     st.rerun()
                 except Exception as e:
-                    st.error(f"Failed to load sheet: {e}")
+                    st.error(f"Google auth failed: {e}")
 
-        st.markdown("---")
+        creds = get_google_credentials()
 
+        if creds is None:
+            # Not signed in — show Sign In button
+            try:
+                auth_url, _ = get_auth_url()
+                st.link_button("🔐 Sign in with Google", auth_url)
+                st.caption("You will be redirected to Google and then back to this app automatically.")
+            except Exception as e:
+                st.error(f"Could not generate auth URL: {e}")
+        else:
+            # Signed in — show sheet loader
+            st.success("✓ Google account connected")
+            if st.button("Disconnect Google account"):
+                del st.session_state["google_token"]
+                st.rerun()
+
+            sheet_url = st.text_input(
+                "Paste your Google Sheet URL:",
+                placeholder="https://docs.google.com/spreadsheets/d/...",
+            )
+            if sheet_url and st.button("📥 Load Google Sheet"):
+                with st.spinner("Loading sheet…"):
+                    try:
+                        gdf = load_google_sheet(sheet_url, creds)
+                        st.session_state.update({
+                            "original_df":    gdf.copy(),
+                            "working_df":     gdf.copy(),
+                            "history": [], "log": [],
+                            "filename":       "Google Sheet",
+                            "last_msg":       f"✓ Loaded Google Sheet — {len(gdf):,} rows × {gdf.shape[1]} columns.",
+                            "last_msg_type":  "success",
+                            "last_before": None, "last_after": None, "last_impact": None,
+                        })
+                        log_step("load_google_sheet", {"url": sheet_url}, list(gdf.columns))
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Failed to load sheet: {e}")
+
+    # ── File Upload Section ────────────────────────────
+    st.markdown("---")
     uploaded = st.file_uploader(
         "Drop your dataset here",
         type=["csv", "xlsx", "xls", "json"],
@@ -488,11 +542,11 @@ if page == "📁 Upload & Overview":
                 raw = uploaded.getvalue()
                 df = load_file(uploaded.name, raw)
                 st.session_state.update({
-                    "original_df": df.copy(),
-                    "working_df": df.copy(),
+                    "original_df":   df.copy(),
+                    "working_df":    df.copy(),
                     "history": [], "log": [],
-                    "filename": uploaded.name,
-                    "last_msg": f"✓ Loaded '{uploaded.name}' — {len(df):,} rows × {df.shape[1]} columns.",
+                    "filename":      uploaded.name,
+                    "last_msg":      f"✓ Loaded '{uploaded.name}' — {len(df):,} rows × {df.shape[1]} columns.",
                     "last_msg_type": "success",
                     "last_before": None, "last_after": None, "last_impact": None,
                 })
@@ -636,7 +690,6 @@ elif page == "🔧 Cleaning Studio":
             st.caption(f"Missing in **{col}**: {nm:,} ({nm / len(df) * 100:.1f}%)")
 
             is_num = pd.api.types.is_numeric_dtype(df[col])
-            method_opts = ["Constant value", "Forward Fill", "Backward Fill"]
             if is_num:
                 method_opts = ["Mean", "Median", "Constant value", "Forward Fill", "Backward Fill", "Interpolate"]
             else:
@@ -839,7 +892,6 @@ elif page == "🔧 Cleaning Studio":
                 card(f"⚠ This column has {n_unique_enc} unique values — one-hot encoding will add {n_unique_enc} new columns. Consider grouping rare values first.", "warn")
             drop_orig = st.checkbox("Drop original column after encoding", value=True)
             drop_first = st.checkbox("Drop first dummy column (avoids multicollinearity)", value=False)
-
             st.caption(f"Will create {n_unique_enc} new binary columns.")
             if st.button("✓ One-Hot Encode"):
                 before = df.copy(); save_undo(); new_df = df.copy()
@@ -880,7 +932,6 @@ elif page == "🔧 Cleaning Studio":
           <div class="impact-cell"><div class="ic-lbl">Range</div><div class="ic-val" style="font-size:.85rem">{s.min():.3g} → {s.max():.3g}</div></div>
         </div>""", unsafe_allow_html=True)
 
-        # Quick box plot using matplotlib (required)
         fig_m, ax = plt.subplots(figsize=(8, 2.5))
         clean = s.dropna()
         ax.boxplot(clean, vert=False, patch_artist=True,
@@ -956,7 +1007,6 @@ elif page == "🔧 Cleaning Studio":
                 return n if iqr == 0 else (n - med) / iqr
 
         if cols_sel:
-            # Show before/after stats preview
             preview_data = []
             for c in cols_sel:
                 orig_s = pd.to_numeric(df[c], errors="coerce")
@@ -1177,7 +1227,6 @@ elif page == "📊 Visualization Builder":
     chart = st.selectbox("Chart type:", list(CHART_TYPES.keys()))
     card(CHART_TYPES[chart], "info")
 
-    # Optional filter
     with st.expander("🔽 Filter rows (optional)", expanded=False):
         fm = st.selectbox("Filter by:", ["No filter", "Category values", "Numeric range"])
         fdf = df.copy()
@@ -1202,7 +1251,6 @@ elif page == "📊 Visualization Builder":
     st.markdown("---")
     fig = None
 
-    # ── Histogram ──
     if chart == "📊 Histogram":
         if not nc:
             card("Need at least one numeric column.", "warn"); st.stop()
@@ -1218,7 +1266,6 @@ elif page == "📊 Visualization Builder":
                            title=f"Distribution of {col_x}")
         fig = theme_fig(fig)
 
-    # ── Box Plot ──
     elif chart == "📦 Box Plot":
         if not nc:
             card("Need at least one numeric column.", "warn"); st.stop()
@@ -1226,7 +1273,6 @@ elif page == "📊 Visualization Builder":
         col_x = st.selectbox("Group by (optional):", ["None"] + cc)
         x = None if col_x == "None" else col_x
 
-        # matplotlib box plot (required)
         fig_m, ax = plt.subplots(figsize=(10, 4))
         if x is None:
             data_to_plot = [pd.to_numeric(fdf[col_y], errors="coerce").dropna().tolist()]
@@ -1235,12 +1281,12 @@ elif page == "📊 Visualization Builder":
             groups = sorted(fdf[x].dropna().unique())[:15]
             data_to_plot = [pd.to_numeric(fdf[fdf[x] == g][col_y], errors="coerce").dropna().tolist() for g in groups]
             labels = [str(g) for g in groups]
-        bp = ax.boxplot(data_to_plot, labels=labels, patch_artist=True,
-                        boxprops=dict(facecolor="#6366f120", color="#6366f1"),
-                        medianprops=dict(color="#06b6d4", linewidth=2),
-                        whiskerprops=dict(color="#6366f1"),
-                        capprops=dict(color="#6366f1"),
-                        flierprops=dict(marker="o", color="#ef4444", alpha=0.5, markersize=4))
+        ax.boxplot(data_to_plot, labels=labels, patch_artist=True,
+                   boxprops=dict(facecolor="#6366f120", color="#6366f1"),
+                   medianprops=dict(color="#06b6d4", linewidth=2),
+                   whiskerprops=dict(color="#6366f1"),
+                   capprops=dict(color="#6366f1"),
+                   flierprops=dict(marker="o", color="#ef4444", alpha=0.5, markersize=4))
         ax.set_title(f"Box Plot — {col_y}" + (f" by {x}" if x else ""), fontweight="bold")
         ax.set_ylabel(col_y)
         if x:
@@ -1251,12 +1297,10 @@ elif page == "📊 Visualization Builder":
         st.pyplot(fig_m, use_container_width=True)
         plt.close(fig_m)
 
-        # Also show interactive plotly version
         fig = px.box(fdf, x=x, y=col_y, title=f"Box Plot — {col_y}" + (f" by {x}" if x else ""),
                      color=x, points="outliers")
         fig = theme_fig(fig)
 
-    # ── Scatter ──
     elif chart == "🔵 Scatter Plot":
         if len(nc) < 2:
             card("Need at least 2 numeric columns.", "warn"); st.stop()
@@ -1275,7 +1319,6 @@ elif page == "📊 Visualization Builder":
                          opacity=0.7, title=f"{col_y} vs {col_x}")
         fig = theme_fig(fig)
 
-    # ── Line Chart ──
     elif chart == "📈 Line Chart":
         if not nc:
             card("Need at least one numeric column.", "warn"); st.stop()
@@ -1302,7 +1345,6 @@ elif page == "📊 Visualization Builder":
                           markers=len(plot_df) < 100)
             fig = theme_fig(fig)
 
-    # ── Bar Chart ──
     elif chart == "📊 Bar Chart":
         if not cc:
             card("Need at least one category column.", "warn"); st.stop()
@@ -1334,7 +1376,6 @@ elif page == "📊 Visualization Builder":
                          title=f"{agg} by {col_x} (top {top_n})", text_auto=True)
         fig = theme_fig(fig)
 
-    # ── Correlation Heatmap ──
     elif chart == "🌡 Correlation Heatmap":
         if len(nc) < 2:
             card("Need at least 2 numeric columns.", "warn"); st.stop()
@@ -1349,7 +1390,6 @@ elif page == "📊 Visualization Builder":
                             title=f"Correlation Matrix ({method.title()})")
             fig = theme_fig(fig)
 
-            # Also matplotlib heatmap
             fig_m, ax = plt.subplots(figsize=(max(6, len(sel)), max(5, len(sel) - 1)))
             im = ax.imshow(corr.values, cmap="RdBu_r", vmin=-1, vmax=1, aspect="auto")
             plt.colorbar(im, ax=ax, shrink=0.8)
@@ -1380,87 +1420,59 @@ elif page == "📤 Export & Report":
     if df is None:
         st.warning("Upload a dataset first."); st.stop()
 
-    # Before / After summary
     if orig is not None:
         sec("Before vs After Summary")
-        rd = len(df) - len(orig)
-        cd = df.shape[1] - orig.shape[1]
-        md = int(df.isna().sum().sum()) - int(orig.isna().sum().sum())
         impact_strip({
             "rb": len(orig), "ra": len(df),
             "cb": orig.shape[1], "ca": df.shape[1],
             "mb": int(orig.isna().sum().sum()), "ma": int(df.isna().sum().sum()),
         })
+        rd = len(df) - len(orig)
+        md = int(df.isna().sum().sum()) - int(orig.isna().sum().sum())
         c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Original Rows", f"{len(orig):,}")
-        c2.metric("Cleaned Rows", f"{len(df):,}", delta=f"{rd:+,}", delta_color="off")
+        c1.metric("Original Rows",    f"{len(orig):,}")
+        c2.metric("Cleaned Rows",     f"{len(df):,}",  delta=f"{rd:+,}", delta_color="off")
         c3.metric("Original Missing", f"{int(orig.isna().sum().sum()):,}")
-        c4.metric("Cleaned Missing", f"{int(df.isna().sum().sum()):,}", delta=f"{md:+,}", delta_color="inverse")
+        c4.metric("Cleaned Missing",  f"{int(df.isna().sum().sum()):,}", delta=f"{md:+,}", delta_color="inverse")
 
-    # Transformation Log
     sec("Transformation Log")
     log = st.session_state["log"]
     if log:
         log_df = pd.DataFrame([{
-            "Step": i + 1,
+            "Step":      i + 1,
             "Timestamp": e["timestamp"],
-            "Action": e["step"],
-            "Params": json.dumps(e.get("params", {})),
-            "Columns": ", ".join(e.get("affected_columns", [])) or "—",
+            "Action":    e["step"],
+            "Params":    json.dumps(e.get("params", {})),
+            "Columns":   ", ".join(e.get("affected_columns", [])) or "—",
         } for i, e in enumerate(log)])
         st.dataframe(log_df, use_container_width=True, height=300)
     else:
         card("No transformations logged yet — apply some cleaning steps first.", "info")
 
-    # Downloads
     sec("Download Files")
     c1, c2, c3, c4 = st.columns(4)
     with c1:
-        st.download_button(
-            "⬇ Cleaned CSV",
-            to_csv_bytes(df),
-            file_name="cleaned_dataset.csv",
-            mime="text/csv",
-            use_container_width=True,
-        )
+        st.download_button("⬇ Cleaned CSV", to_csv_bytes(df), "cleaned_dataset.csv", "text/csv", use_container_width=True)
     with c2:
         if EXCEL_OK:
-            st.download_button(
-                "⬇ Cleaned Excel",
-                to_excel_bytes(df),
-                file_name="cleaned_dataset.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                use_container_width=True,
-            )
+            st.download_button("⬇ Cleaned Excel", to_excel_bytes(df), "cleaned_dataset.xlsx",
+                               "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", use_container_width=True)
         else:
             st.caption("Install `openpyxl` for Excel export.")
     with c3:
         recipe = {
             "generated_at": datetime.now().isoformat(),
-            "source_file": st.session_state.get("filename", "unknown"),
-            "steps": log,
+            "source_file":  st.session_state.get("filename", "unknown"),
+            "steps":        log,
         }
-        st.download_button(
-            "⬇ JSON Recipe",
-            json.dumps(recipe, indent=2).encode(),
-            file_name="transformation_recipe.json",
-            mime="application/json",
-            use_container_width=True,
-        )
+        st.download_button("⬇ JSON Recipe", json.dumps(recipe, indent=2).encode(),
+                           "transformation_recipe.json", "application/json", use_container_width=True)
     with c4:
         if orig is not None:
-            st.download_button(
-                "⬇ Original CSV",
-                to_csv_bytes(orig),
-                file_name="original_dataset.csv",
-                mime="text/csv",
-                use_container_width=True,
-            )
+            st.download_button("⬇ Original CSV", to_csv_bytes(orig), "original_dataset.csv", "text/csv", use_container_width=True)
 
-    # Final profile
     sec("Final Dataset Profile")
     st.dataframe(profile_df(df), use_container_width=True)
 
-    # Raw JSON recipe
     with st.expander("View JSON Recipe (raw)"):
         st.code(json.dumps(recipe if log else {"steps": []}, indent=2), language="json")
